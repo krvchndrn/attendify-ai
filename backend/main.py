@@ -14,9 +14,19 @@ from services.scheduler_service import generate_weekly_reports_job
 
 app = FastAPI(title="Attendify.ai API", version="1.0.0")
 
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://0.0.0.0:3000",
+    "https://frontend-production-8713d.up.railway.app",
+]
+# Allow any extra origins set via env var (comma-separated)
+_extra = os.environ.get("CORS_ORIGINS", "")
+if _extra:
+    ALLOWED_ORIGINS += [o.strip() for o in _extra.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://0.0.0.0:3000"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
