@@ -28,4 +28,3 @@ for u in users_to_create:
 db.commit()
 db.close()
 print("Reseed complete.")
-EOF
