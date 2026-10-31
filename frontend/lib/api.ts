@@ -1,7 +1,21 @@
 import axios from "axios";
 
-// API base URL for Railway deployment
-export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+// Runtime env injection: the Dockerfile writes /public/env-config.js at container start,
+// which sets window.__ENV__.NEXT_PUBLIC_API_URL — this overrides the build-time baked value.
+// The script is loaded synchronously in <head> before any app JS, so by the time
+// this module runs in the browser, window.__ENV__ is already set.
+// Fallback chain: runtime window var → build-time env → localhost default.
+function getApiBase(): string {
+  if (typeof window !== "undefined") {
+    const v = (window as any).__ENV__?.NEXT_PUBLIC_API_URL;
+    if (v && !v.includes("PLACEHOLDER")) return v;
+  }
+  const baked = process.env.NEXT_PUBLIC_API_URL;
+  if (baked && !baked.includes("PLACEHOLDER")) return baked;
+  return "http://localhost:8000/api/v1";
+}
+
+export const API_BASE = getApiBase();
 
 const api = axios.create({ baseURL: API_BASE });
 

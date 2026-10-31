@@ -17,6 +17,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en" className={`dark ${inter.variable}`} suppressHydrationWarning>
       <head>
+        {/* Runtime env injection — must load before any app JS so API_BASE resolves correctly */}
+        {/* eslint-disable-next-line @next/next/no-sync-scripts */}
+        <script src="/env-config.js" />
         {/* Apply the saved theme before first paint so there's no dark→light flash */}
         <script
           dangerouslySetInnerHTML={{
