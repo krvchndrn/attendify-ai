@@ -41,7 +41,12 @@ class LoginResponse(BaseModel):
 
 @router.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == form_data.username).first()
+  user = db.query(models.User).filter(models.User.email == form_data.username).first()
+    print(f"DEBUG LOGIN: email={form_data.username!r} user_found={user is not None}")
+    if user:
+        import hashlib
+        computed = hashlib.sha256(form_data.password.encode()).hexdigest()
+        print(f"DEBUG LOGIN: computed={computed[:12]}... stored={user.password_hash[:12]}... match={computed == user.password_hash}")
     if not user or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
