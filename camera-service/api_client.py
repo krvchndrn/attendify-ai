@@ -1,8 +1,10 @@
 import requests
 import base64
 import logging
+import tempfile
+import os
 from datetime import date, time
-from config import API_BASE_URL, CAMERA_SERVICE_EMAIL, CAMERA_SERVICE_PASSWORD
+from config import API_BASE_URL, BACKEND_UPLOADS_URL, CAMERA_SERVICE_EMAIL, CAMERA_SERVICE_PASSWORD
 
 logger = logging.getLogger("api_client")
 
@@ -53,6 +55,36 @@ def _post(url: str, **kwargs):
         r = requests.post(url, headers=_auth_headers(), timeout=10, **kwargs)
     r.raise_for_status()
     return r
+
+
+def download_photo(db_path: str) -> str | None:
+    """
+    Download a student photo from the backend to a local temp file.
+    db_path is the relative path stored in the DB, e.g. 'uploads/1/abc.jpg'.
+    Returns the local temp file path, or None on failure.
+    """
+    # Build the full download URL
+    # db_path is like "uploads/1/abc.jpg" — strip leading "uploads/" if present
+    relative = db_path.lstrip("/")
+    if relative.startswith("uploads/"):
+        relative = relative[len("uploads/"):]
+
+    url = f"{BACKEND_UPLOADS_URL}/{relative}"
+    try:
+        r = requests.get(url, headers=_auth_headers(), timeout=30)
+        if r.status_code == 401:
+            login()
+            r = requests.get(url, headers=_auth_headers(), timeout=30)
+        r.raise_for_status()
+
+        ext = os.path.splitext(db_path)[1] or ".jpg"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+        tmp.write(r.content)
+        tmp.close()
+        return tmp.name
+    except Exception as e:
+        logger.warning(f"Could not download photo {url}: {e}")
+        return None
 
 
 def get_students_pending_enrollment():

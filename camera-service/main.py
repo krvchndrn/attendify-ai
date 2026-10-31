@@ -1,30 +1,36 @@
 """
 Attendify.ai Camera Service
 ============================
-Runs continuously:
-  1. On start: processes any students pending face enrollment (photos uploaded but no embeddings).
-  2. After school start time: opens camera, scans for late students, posts detections to API.
-  3. Reloads face database every 5 minutes to pick up new enrollments.
+Runs at the school gate camera (Raspberry Pi or any PC with a webcam).
+
+On start:
+  1. Authenticates with the Railway backend.
+  2. Downloads photos for any students pending face enrollment, encodes them,
+     and stores embeddings back in the backend.
+  3. Loads all enrolled students' face embeddings into memory.
+  4. Opens the camera and scans for late students after school start time.
 
 Usage:
-    source venv/bin/activate
-    python main.py
-
-    # Enrollment-only mode (no camera):
-    python main.py --enroll-only
+    cp .env.example .env          # fill in API_BASE_URL and credentials
+    pip install -r requirements.txt
+    python main.py                # full gate-camera mode
+    python main.py --enroll-only  # enrollment only, then exit
 """
 
 import cv2
 import time
 import logging
 import argparse
+import os
 import sys
+import tempfile
 from datetime import datetime, date
 
 import config
 from detector import FaceEnroller, FaceRecognizer
 import api_client
 from api_client import (
+    download_photo,
     get_students_pending_enrollment,
     post_embeddings,
     get_all_enrolled_students,
@@ -43,7 +49,10 @@ RELOAD_INTERVAL_SECONDS = 300  # Reload face DB every 5 minutes
 
 
 def run_enrollment():
-    """Process students with photos but no face embeddings."""
+    """
+    Download photos for students pending enrollment, compute embeddings locally,
+    and store them back in the backend API.
+    """
     logger.info("Checking for students pending face enrollment...")
     pending = get_students_pending_enrollment()
 
@@ -53,17 +62,40 @@ def run_enrollment():
 
     enroller = FaceEnroller()
     for student in pending:
-        name = student.get("name", f"ID {student['id']}")
-        paths = student.get("photo_paths", [])
-        logger.info(f"Enrolling {name} with {len(paths)} photos...")
+        sid = student["id"]
+        name = student.get("name", f"ID {sid}")
+        db_paths = student.get("photo_paths") or []
 
-        encodings = enroller.enroll(paths)
-        if not encodings:
-            logger.warning(f"  No faces found in any photo for {name}. Skipping.")
-            continue
+        logger.info(f"Enrolling {name}: downloading {len(db_paths)} photo(s)...")
 
-        post_embeddings(student["id"], encodings)
-        logger.info(f"  Enrolled {name}: {len(encodings)} face vectors stored.")
+        tmp_files = []
+        local_paths = []
+        for db_path in db_paths:
+            local = download_photo(db_path)
+            if local:
+                local_paths.append(local)
+                tmp_files.append(local)
+            else:
+                logger.warning(f"  Could not download {db_path}")
+
+        try:
+            if not local_paths:
+                logger.warning(f"  {name}: no downloadable photos — skipping")
+                continue
+
+            encodings = enroller.enroll(local_paths)
+            if not encodings:
+                logger.warning(f"  {name}: no faces detected — skipping")
+                continue
+
+            post_embeddings(sid, encodings)
+            logger.info(f"  Enrolled {name}: {len(encodings)} face vector(s) stored")
+        finally:
+            for f in tmp_files:
+                try:
+                    os.unlink(f)
+                except Exception:
+                    pass
 
 
 def run_camera(recognizer: FaceRecognizer):
@@ -101,17 +133,19 @@ def run_camera(recognizer: FaceRecognizer):
 
             # Only scan after school start time
             if now < config.SCHOOL_START_TIME:
-                wait = (
+                wait_min = (
                     (config.SCHOOL_START_TIME.hour * 60 + config.SCHOOL_START_TIME.minute)
                     - (now.hour * 60 + now.minute)
                 )
-                logger.info(f"School hasn't started yet. Waiting {wait} minutes.")
-                time.sleep(min(wait * 60, 300))
+                logger.info(f"School hasn't started yet. Waiting {wait_min} minutes.")
+                time.sleep(min(wait_min * 60, 300))
                 continue
 
-            # Reload face database periodically
+            # Reload face database periodically (picks up newly enrolled students)
             if time.time() - last_reload > RELOAD_INTERVAL_SECONDS:
                 logger.info("Reloading face database from API...")
+                # Also run enrollment for any students added since last reload
+                run_enrollment()
                 students = get_all_enrolled_students()
                 recognizer.load_students(students)
                 last_reload = time.time()
@@ -123,14 +157,12 @@ def run_camera(recognizer: FaceRecognizer):
                 continue
 
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
             student_id, house_id, confidence = recognizer.recognize(frame_rgb)
 
             if student_id is not None and student_id not in logged_today:
                 logger.info(
                     f"Detected student {student_id} (confidence={confidence:.2f}) at {now.strftime('%H:%M:%S')}"
                 )
-
                 image_bytes = recognizer.get_face_image_bytes(frame_rgb)
                 result = post_late_entry(
                     student_id=student_id,
@@ -140,27 +172,9 @@ def run_camera(recognizer: FaceRecognizer):
                     confidence=confidence,
                     image_bytes=image_bytes,
                 )
-
                 if result and result.get("id"):
                     logged_today.add(student_id)
                     logger.info(f"Logged late entry id={result['id']} for student {student_id}")
-
-            elif student_id is None and confidence == 0.0:
-                # Face detected but didn't match anyone
-                faces_present = len(cv2.CascadeClassifier(
-                    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-                ).detectMultiScale(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY), 1.1, 4))
-                if faces_present:
-                    logger.info("Unknown face detected — posting for review")
-                    image_bytes = recognizer.get_face_image_bytes(frame_rgb)
-                    post_late_entry(
-                        student_id=None,
-                        house_id=None,
-                        arrival_time=now,
-                        entry_date=today,
-                        confidence=0.0,
-                        image_bytes=image_bytes,
-                    )
 
             time.sleep(config.SCAN_INTERVAL_SECONDS)
 
@@ -177,26 +191,35 @@ def main():
     parser.add_argument("--enroll-only", action="store_true", help="Run enrollment then exit")
     args = parser.parse_args()
 
+    logger.info("=" * 60)
+    logger.info("Attendify.ai Camera Service")
+    logger.info(f"  API:     {config.API_BASE_URL}")
+    logger.info(f"  Photos:  {config.BACKEND_UPLOADS_URL}")
+    logger.info("=" * 60)
+
     # Authenticate with backend API
     if not api_client.login():
-        logger.error("Cannot authenticate with backend — check credentials in .env")
+        logger.error("Cannot authenticate with backend — check .env credentials")
         sys.exit(1)
 
-    # Always run enrollment on start
+    # Always run enrollment on start (idempotent — skips already-enrolled students)
     run_enrollment()
 
     if args.enroll_only:
         logger.info("Enrollment-only mode — exiting.")
         return
 
-    # Load all students for recognition
+    # Load all enrolled students into memory
     logger.info("Loading enrolled students from API...")
     students = get_all_enrolled_students()
     recognizer = FaceRecognizer(confidence_threshold=config.CONFIDENCE_THRESHOLD)
     recognizer.load_students(students)
 
     if not recognizer.known_encodings:
-        logger.warning("No enrolled students found. Recognition will post all faces as 'needs_review'.")
+        logger.warning(
+            "No enrolled students found. "
+            "Add students with photos via the web UI, then run enrollment."
+        )
 
     run_camera(recognizer)
 
